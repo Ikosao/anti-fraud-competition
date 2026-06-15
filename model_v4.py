@@ -1,4 +1,4 @@
-# model_v4_fixed.py – исправленный adversarial + улучшенные признаки
+# model_v4_final.py – честная временная валидация + adversarial validation (без ошибок)
 import pandas as pd
 import numpy as np
 from catboost import CatBoostClassifier
@@ -8,7 +8,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 print("="*60)
-print("МОДЕЛЬ АНТИФРОДА v4.1 – ИСПРАВЛЕННАЯ")
+print("МОДЕЛЬ АНТИФРОДА v4 FINAL – ЧЕСТНАЯ ВАЛИДАЦИЯ")
 print("="*60)
 
 # ========== 1. Загрузка ==========
@@ -40,24 +40,18 @@ def create_features(df):
     df['high_amount'] = (df['amount']>300).astype(int)
     df['very_high_amount'] = (df['amount']>1000).astype(int)
 
-    # device_id
     df['device_id'] = df['device_id'].fillna('missing').astype(str)
     df['device_enc'] = pd.factorize(df['device_id'])[0]
 
-    # категориальные
     df['income_bracket'] = df['income_bracket'].fillna('unknown')
-    df['merchant_category'] = df['merchant_category'].astype(str)
-    df['channel'] = df['channel'].astype(str)
-    df['region'] = df['region'].astype(str)
     return df
 
 print("2. Создание признаков...")
 train = create_features(train)
 test = create_features(test)
 
-# ========== 3. Агрегаты (без fraud_rate!) ==========
+# ========== 3. Агрегаты ==========
 def build_aggregates(base, target_df):
-    # клиенты
     cust = base.groupby('customer_id').agg(
         cust_avg_amount=('amount','mean'),
         cust_std_amount=('amount','std'),
@@ -75,7 +69,6 @@ def build_aggregates(base, target_df):
     cust.drop('last_time', axis=1, inplace=True)
     cust['cust_std_amount'] = cust['cust_std_amount'].fillna(0)
 
-    # мерчанты
     merch = base.groupby('merchant_id').agg(
         merch_avg_amount=('amount','mean'),
         merch_std_amount=('amount','std'),
@@ -86,7 +79,6 @@ def build_aggregates(base, target_df):
     ).reset_index()
     merch['merch_std_amount'] = merch['merch_std_amount'].fillna(0)
 
-    # категории
     cat = base.groupby('merchant_category').agg(
         cat_avg_amount=('amount','mean'),
         cat_count=('amount','count'),
@@ -94,13 +86,11 @@ def build_aggregates(base, target_df):
         cat_foreign_pct=('is_foreign','mean')
     ).reset_index()
 
-    # регион
     region = base.groupby('region').agg(
         region_avg_amount=('amount','mean'),
         region_highrisk_pct=('high_risk_channel','mean')
     ).reset_index()
 
-    # объединение
     out = target_df.merge(cust, on='customer_id', how='left')
     out = out.merge(merch, on='merchant_id', how='left')
     out = out.merge(cat, on='merchant_category', how='left')
@@ -110,7 +100,7 @@ def build_aggregates(base, target_df):
             out[c] = out[c].fillna(0)
     return out
 
-def add_combination_features(df):
+def add_combinations(df):
     df['amount_to_cust_avg'] = df['amount']/(df['cust_avg_amount']+1)
     df['amount_to_merch_avg'] = df['amount']/(df['merch_avg_amount']+1)
     df['amount_to_cat_avg'] = df['amount']/(df['cat_avg_amount']+1)
@@ -122,10 +112,7 @@ def add_combination_features(df):
     df['unusual_time'] = ((df['is_night']==1)&(df['cust_night_pct']<0.1)).astype(int)
     return df
 
-# ========== 4. Честная валидация ==========
-print("\n3. Честная временная валидация...")
-train = train.sort_values('timestamp')
-tscv = TimeSeriesSplit(n_splits=5)
+# ========== 4. Списки признаков ==========
 base_features = [
     'amount','amount_log','amount_sqrt','amount_round10','amount_round100',
     'is_foreign','card_present','age','account_age_days',
@@ -150,49 +137,49 @@ cat_features = ['merchant_category','channel','region','income_bracket']
 all_features = base_features + agg_features + combo_features
 print(f"Всего признаков: {len(all_features)} + {len(cat_features)} кат.")
 
+# ========== 5. Честная валидация ==========
+print("\n3. Честная временная валидация (агрегаты внутри фолда)...")
+train = train.sort_values('timestamp')
+tscv = TimeSeriesSplit(n_splits=5)
 scores = []
+
 for fold, (tr_idx, val_idx) in enumerate(tscv.split(train)):
     train_fold = train.iloc[tr_idx].copy()
     val_fold = train.iloc[val_idx].copy()
     if val_fold['is_fraud'].sum()==0: continue
+    
     train_fold = build_aggregates(train_fold, train_fold)
     val_fold = build_aggregates(train_fold, val_fold)
-    train_fold = add_combination_features(train_fold)
-    val_fold = add_combination_features(val_fold)
-
-    X_tr = train_fold[all_features + cat_features]
-    y_tr = train_fold['is_fraud']
-    X_va = val_fold[all_features + cat_features]
-    y_va = val_fold['is_fraud']
+    train_fold = add_combinations(train_fold)
+    val_fold = add_combinations(val_fold)
 
     model = CatBoostClassifier(
         iterations=2000, learning_rate=0.02, depth=8,
         cat_features=cat_features, verbose=False,
         random_seed=42, class_weights=[1,25]
     )
-    model.fit(X_tr, y_tr)
-    pred = model.predict_proba(X_va)[:,1]
-    scores.append(average_precision_score(y_va, pred))
-    print(f"   Fold {fold+1}: PR-AUC = {scores[-1]:.4f}")
+    model.fit(train_fold[all_features + cat_features], train_fold['is_fraud'])
+    pred = model.predict_proba(val_fold[all_features + cat_features])[:,1]
+    sc = average_precision_score(val_fold['is_fraud'], pred)
+    scores.append(sc)
+    print(f"   Fold {fold+1}: PR-AUC = {sc:.4f}")
 
 print(f"\n   Средний честный PR-AUC: {np.mean(scores):.4f}")
 
-# ========== 5. Adversarial validation (исправлено) ==========
+# ========== 6. Adversarial validation ==========
 print("\n4. Adversarial validation...")
-# Объединяем train и test, метим is_test, перемешиваем
 train_adv = train.copy()
 train_adv['is_test'] = 0
 test_adv = test.copy()
 test_adv['is_test'] = 1
 combined = pd.concat([train_adv, test_adv], ignore_index=True)
 combined = create_features(combined)
-combined = build_aggregates(train, combined)  # база – train
-combined = add_combination_features(combined)
+combined = build_aggregates(train, combined)
+combined = add_combinations(combined)
 
 X_adv = combined[all_features + cat_features]
 y_adv = combined['is_test']
 
-# Разделяем перемешанные данные, чтобы в train были оба класса
 X_tr_adv, X_val_adv, y_tr_adv, y_val_adv = train_test_split(
     X_adv, y_adv, test_size=0.3, random_state=42, stratify=y_adv
 )
@@ -205,18 +192,18 @@ pred_adv = adv_model.predict_proba(X_val_adv)[:,1]
 auc_adv = roc_auc_score(y_val_adv, pred_adv)
 print(f"   ROC-AUC отличия train от test: {auc_adv:.4f}")
 if auc_adv > 0.7:
-    print("    Сильный сдвиг! Топ-10 важных признаков:")
+    print("   ⚠️ Сильный сдвиг! Топ-10 важных признаков:")
     imp = pd.DataFrame({'feat':all_features+cat_features, 'imp':adv_model.feature_importances_})
     print(imp.sort_values('imp',ascending=False).head(10))
 else:
     print("   ✓ Сдвиг небольшой, перенос хороший.")
 
-# ========== 6. Финальная модель ==========
+# ========== 7. Финальная модель ==========
 print("\n5. Финальное обучение...")
 train_full = build_aggregates(train, train)
 test_full = build_aggregates(train, test)
-train_full = add_combination_features(train_full)
-test_full = add_combination_features(test_full)
+train_full = add_combinations(train_full)
+test_full = add_combinations(test_full)
 
 final_model = CatBoostClassifier(
     iterations=2000, learning_rate=0.02, depth=8,
